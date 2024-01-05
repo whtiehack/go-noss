@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"io/ioutil"
 
 	"encoding/json"
 	"errors"
@@ -38,7 +39,7 @@ var (
 )
 
 func init() {
-
+	log.SetOutput(os.Stdout)
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("Error loading .env file")
@@ -47,6 +48,7 @@ func init() {
 	pk = os.Getenv("pk")
 	numberOfWorkers, _ = strconv.Atoi(os.Getenv("numberOfWorkers"))
 	arbRpcUrl = os.Getenv("arbRpcUrl")
+	log.Println("numberOfWorkers:", numberOfWorkers)
 }
 
 func generateRandomString(length int) (string, error) {
@@ -99,13 +101,12 @@ type EV struct {
 	PubKey    string          `json:"pubkey"`
 }
 
-func mine(ctx context.Context, messageId string, client *ethclient.Client) {
+func mine(ctx context.Context, messageId string, blkNum uint64, hash string) {
 
 	replayUrl := "wss://relay.noscription.org/"
 	difficulty := 21
 
 	// Create a channel to signal the finding of a valid nonce
-	foundEvent := make(chan nostr.Event, 1)
 	// Create a channel to signal all workers to stop
 	content := `{"p":"nrc-20","op":"mint","tick":"noss","amt":"10"}`
 	startTime := time.Now()
@@ -122,82 +123,79 @@ func mine(ctx context.Context, messageId string, client *ethclient.Client) {
 	ev.Tags = ev.Tags.AppendUnique(nostr.Tag{"p", "9be107b0d7218c67b4954ee3e6bd9e4dba06ef937a93f684e42f730a0c3d053c"})
 	ev.Tags = ev.Tags.AppendUnique(nostr.Tag{"e", "51ed7939a984edee863bfbb2e66fdc80436b000a8ddca442d83e6a2bf1636a95", replayUrl, "root"})
 	ev.Tags = ev.Tags.AppendUnique(nostr.Tag{"e", messageId, replayUrl, "reply"})
-	ev.Tags = ev.Tags.AppendUnique(nostr.Tag{"seq_witness", strconv.Itoa(int(blockNumber)), hash})
+	ev.Tags = ev.Tags.AppendUnique(nostr.Tag{"seq_witness", strconv.Itoa(int(blkNum)), hash})
 	// Start multiple worker goroutines
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				evCopy := ev
-				evCopy, err := Generate(evCopy, difficulty)
-				if err != nil {
-					// fmt.Println(err)
-					atomic.AddInt32(&currentWorkers, -1)
-					return
-				}
-				foundEvent <- evCopy
-			}
-		}
-	}()
+	evCopy := ev
+	evNew, err := Generate(evCopy, difficulty)
+	if err != nil {
+		// fmt.Println(err)
+		return
+	}
 
-	select {
-	case evNew := <-foundEvent:
-		evNew.Sign(sk)
+	err = evNew.Sign(sk)
+	if err != nil {
+		fmt.Println("evNew.Sign(sk)", err)
+		return
+	}
 
-		evNewInstance := EV{
-			Sig:       evNew.Sig,
-			Id:        evNew.ID,
-			Kind:      evNew.Kind,
-			CreatedAt: evNew.CreatedAt,
-			Tags:      evNew.Tags,
-			Content:   evNew.Content,
-			PubKey:    evNew.PubKey,
-		}
-		// 将ev转为Json格式
-		eventJSON, err := json.Marshal(evNewInstance)
-		if err != nil {
-			log.Fatal(err)
-		}
+	evNewInstance := EV{
+		Sig:       evNew.Sig,
+		Id:        evNew.ID,
+		Kind:      evNew.Kind,
+		CreatedAt: evNew.CreatedAt,
+		Tags:      evNew.Tags,
+		Content:   evNew.Content,
+		PubKey:    evNew.PubKey,
+	}
+	// 将ev转为Json格式
+	eventJSON, err := json.Marshal(evNewInstance)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
 
-		wrapper := map[string]json.RawMessage{
-			"event": eventJSON,
-		}
+	wrapper := map[string]json.RawMessage{
+		"event": eventJSON,
+	}
 
-		// 将包装后的对象序列化成JSON
-		wrapperJSON, err := json.MarshalIndent(wrapper, "", "  ") // 使用MarshalIndent美化输出
-		if err != nil {
-			log.Fatalf("Error marshaling wrapper: %v", err)
-		}
+	// 将包装后的对象序列化成JSON
+	wrapperJSON, err := json.MarshalIndent(wrapper, "", "  ") // 使用MarshalIndent美化输出
+	if err != nil {
+		log.Fatalf("Error marshaling wrapper: %v", err)
+	}
 
-		url := "https://api-worker.noscription.org/inscribe/postEvent"
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(wrapperJSON))
-		if err != nil {
-			log.Fatalf("Error creating request: %v", err)
-		}
+	url := "https://api-worker.noscription.org/inscribe/postEvent"
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(wrapperJSON))
+	if err != nil {
+		log.Fatalf("Error creating request: %v", err)
+	}
 
-		// 设置HTTP Header
-		req.Header.Set("Content-Type", "application/json")
-
+	// 设置HTTP Header
+	req.Header.Set("Content-Type", "application/json")
+	{
 		// 发送请求
-		client := &http.Client{}
-		resp, err := client.Do(req)
+		resp, err := postEventClient.Do(req)
 		if err != nil {
 			log.Fatalf("Error sending request: %v", err)
 		}
 		defer resp.Body.Close()
-
 		fmt.Println("Response Status:", resp.Status)
+		if resp.StatusCode == 429 {
+			time.Sleep(60 * time.Second)
+			return
+		}
 		spendTime := time.Since(startTime)
-		// fmt.Println("Response Body:", string(body))
-		fmt.Println(nostr.Now().Time(), "spend: ", spendTime, "!!!!!!!!!!!!!!!!!!!!!published to:", evNew.ID)
-		atomic.StoreInt32(&nonceFound, 0)
-	case <-ctx.Done():
-		fmt.Print("done")
+		if resp.StatusCode == 200 {
+			body, _ := ioutil.ReadAll(resp.Body)
+			fmt.Println("Response Body:", string(body))
+		}
+		fmt.Println(nostr.Now().Time(), "spend: ", spendTime, "!!!!!!!!!!!!!!!!!!!!!published to:", evNew.ID, " msgId:", messageId, " blockNum:", blkNum)
+		atomic.StoreInt32(&nonceFound, 1)
 	}
 
 }
+
+var postEventClient = &http.Client{}
 
 func connectToWSS(url string) (*websocket.Conn, error) {
 	var conn *websocket.Conn
@@ -254,6 +252,7 @@ func main() {
 				hash = header.Hash().Hex()
 				blockNumber = header.Number.Uint64()
 			}
+			log.Println("blockNumber:", blockNumber, "hash:", hash)
 		}
 	}()
 
@@ -271,6 +270,7 @@ func main() {
 				continue
 			}
 			messageId = messageDecode.EventId
+			//fmt.Println("msgId:", messageId, "blockNumber:", blockNumber, "hash:", hash)
 		}
 
 	}()
@@ -287,11 +287,15 @@ func main() {
 			case <-ctx.Done(): // 如果上下文被取消，则退出协程
 				return
 			default:
+				if messageId == "" {
+					continue
+				}
 				if atomic.LoadInt32(&currentWorkers) < int32(numberOfWorkers) {
 					atomic.AddInt32(&currentWorkers, 1) // 增加工作者数量
 					go func(bn uint64, mid string) {
 						defer atomic.AddInt32(&currentWorkers, -1) // 完成后减少工作者数量
-						mine(ctx, mid, client)
+						mine(ctx, mid, blockNumber, hash)
+						//fmt.Println("atomic.LoadInt32(&currentWorkers):", atomic.LoadInt32(&currentWorkers), " exit")
 					}(blockNumber, messageId)
 				}
 			}
