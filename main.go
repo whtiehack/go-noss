@@ -159,7 +159,7 @@ func mine(ctx context.Context, messageId string, blkNum uint64, hash string) {
 	}
 
 	// 将包装后的对象序列化成JSON
-	wrapperJSON, err := json.MarshalIndent(wrapper, "", "  ") // 使用MarshalIndent美化输出
+	wrapperJSON, err := json.Marshal(wrapper) // 使用MarshalIndent美化输出
 	if err != nil {
 		log.Fatalf("Error marshaling wrapper: %v", err)
 	}
@@ -172,6 +172,14 @@ func mine(ctx context.Context, messageId string, blkNum uint64, hash string) {
 
 	// 设置HTTP Header
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0")
+	req.Header.Set("Sec-ch-ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Microsoft Edge\";v=\"120\"")
+	req.Header.Set("Sec-ch-ua-mobile", "?0")
+	req.Header.Set("Sec-ch-ua-platform", "\"Windows\"")
+	req.Header.Set("Sec-fetch-dest", "empty")
+	req.Header.Set("Sec-fetch-mode", "cors")
+	req.Header.Set("Sec-fetch-site", "same-site")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
 	{
 		// 发送请求
 		resp, err := postEventClient.Do(req)
@@ -252,7 +260,7 @@ func main() {
 				hash = header.Hash().Hex()
 				blockNumber = header.Number.Uint64()
 			}
-			log.Println("blockNumber:", blockNumber, "hash:", hash)
+			//log.Println("blockNumber:", blockNumber, "hash:", hash)
 		}
 	}()
 
